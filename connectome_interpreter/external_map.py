@@ -71,13 +71,14 @@ def load_dataset(dataset: str) -> pd.DataFrame:
 
 def _load_local_eyemap(eyemap_path: str, required_cols: tuple) -> pd.DataFrame:
     """
-    Load a user-supplied local eyemap CSV, in place of a bundled ``dataset``.
+    Load a user-supplied local eyemap CSV or Excel file, in place of a bundled
+    ``dataset``.
 
     Args:
-        eyemap_path: Path to a local eyemap CSV file. Files downloaded via
-            https://artxz.github.io/eyemap-archive/ already conform to the expected
-            schema (columns ``p,q,x,y,z[,theta,phi,rootid]``).
-        required_cols: Column names that must be present in the CSV.
+        eyemap_path: Path to a local eyemap CSV or Excel (``.xlsx``) file. Files
+            downloaded via https://artxz.github.io/eyemap-archive/ already conform
+            to the expected schema (columns ``p,q,x,y,z[,theta,phi,rootid]``).
+        required_cols: Column names that must be present in the file.
 
     Returns:
         pd.DataFrame: The loaded eyemap table.
@@ -86,7 +87,10 @@ def _load_local_eyemap(eyemap_path: str, required_cols: tuple) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"eyemap_path {path} does not exist.")
 
-    df = pd.read_csv(path)
+    if path.suffix.lower() in (".xlsx", ".xls"):
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path)
     missing = set(required_cols) - set(df.columns)
     if missing:
         raise ValueError(
@@ -226,8 +230,8 @@ def hex_heatmap(
                 - 'mcns_right': columnar coordinates of individual cells from columnar cell types: L1, L2, L3, L5, Mi1, Mi4, Mi9, C2, C3, Tm1, Tm2, Tm4, Tm9, Tm20, T1, within the medulla of the right optic lobe, from Nern et al. 2024.
                 - 'fafb_right': columnar coordinates of individual cells from columnar cell types, in the right optic lobe of FAFB, from Matsliah et al. 2024.
 
-        eyemap_path (Optional[str]): Path to a local eyemap CSV with at least ``p``
-            and ``q`` columns (e.g. as downloaded from
+        eyemap_path (Optional[str]): Path to a local eyemap CSV or Excel (``.xlsx``)
+            file with at least ``p`` and ``q`` columns (e.g. as downloaded from
             https://artxz.github.io/eyemap-archive/). When given, this takes
             precedence over ``dataset`` for the background hexagon lattice.
         title (Optional[str]): Title for the plot. If None, no title is displayed.
@@ -679,8 +683,8 @@ def plot_mollweide_projection(
 
             - 'Zhao2024': mapping from hexagonal coordinates to 3D coordinates, update from Zhao et al. 2022 (https://www.biorxiv.org/content/10.1101/2022.12.14.520178v1).
 
-        eyemap_path (Optional[str]): Path to a local eyemap CSV with ``p,q,x,y,z``
-            columns (e.g. as downloaded from
+        eyemap_path (Optional[str]): Path to a local eyemap CSV or Excel (``.xlsx``)
+            file with ``p,q,x,y,z`` columns (e.g. as downloaded from
             https://artxz.github.io/eyemap-archive/). When given, this takes
             precedence over ``dataset``.
         marker_size (int): Size of markers in the plot.

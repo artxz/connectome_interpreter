@@ -8,11 +8,13 @@ import plotly.graph_objects as go
 from connectome_interpreter.external_map import hex_heatmap, plot_mollweide_projection
 
 EYEMAP_ROWS = [
-    {"p": 0, "q": 0, "x": 0.0, "y": 0.0, "z": 1.0},
-    {"p": 1, "q": 0, "x": 0.1, "y": 0.0, "z": 0.99},
-    {"p": 0, "q": 1, "x": 0.0, "y": 0.1, "z": 0.99},
-    {"p": -1, "q": 0, "x": -0.1, "y": 0.0, "z": 0.99},
-    {"p": 0, "q": -1, "x": 0.0, "y": -0.1, "z": 0.99},
+    # hex1, hex2 = q, p -- solved from hex_heatmap()'s background_hex build,
+    # x = hex2 - hex1, y = hex2 + hex1, matching x,y = p - q, p + q below.
+    {"p": 0, "q": 0, "x": 0.0, "y": 0.0, "z": 1.0, "hex1": 0, "hex2": 0},
+    {"p": 1, "q": 0, "x": 0.1, "y": 0.0, "z": 0.99, "hex1": 0, "hex2": 1},
+    {"p": 0, "q": 1, "x": 0.0, "y": 0.1, "z": 0.99, "hex1": 1, "hex2": 0},
+    {"p": -1, "q": 0, "x": -0.1, "y": 0.0, "z": 0.99, "hex1": 0, "hex2": -1},
+    {"p": 0, "q": -1, "x": 0.0, "y": -0.1, "z": 0.99, "hex1": -1, "hex2": 0},
 ]
 
 
@@ -21,6 +23,8 @@ class TestEyemapPath(unittest.TestCase):
         self.tmpdir = TemporaryDirectory()
         self.eyemap_path = Path(self.tmpdir.name) / "eyemap.csv"
         pd.DataFrame(EYEMAP_ROWS).to_csv(self.eyemap_path, index=False)
+        self.eyemap_path_xlsx = Path(self.tmpdir.name) / "eyemap.xlsx"
+        pd.DataFrame(EYEMAP_ROWS).to_excel(self.eyemap_path_xlsx, index=False)
 
         # data index format matches "x,y" = (hex2_id - hex1_id, hex2_id + hex1_id),
         # i.e. (p - q, p + q), so it aligns with the rows above.
@@ -36,8 +40,16 @@ class TestEyemapPath(unittest.TestCase):
         fig = hex_heatmap(self.data, eyemap_path=str(self.eyemap_path))
         self.assertIsInstance(fig, go.Figure)
 
+    def test_hex_heatmap_with_eyemap_path_xlsx(self):
+        fig = hex_heatmap(self.data, eyemap_path=str(self.eyemap_path_xlsx))
+        self.assertIsInstance(fig, go.Figure)
+
     def test_plot_mollweide_projection_with_eyemap_path(self):
         fig = plot_mollweide_projection(self.data, eyemap_path=str(self.eyemap_path))
+        self.assertIsInstance(fig, go.Figure)
+
+    def test_plot_mollweide_projection_with_eyemap_path_xlsx(self):
+        fig = plot_mollweide_projection(self.data, eyemap_path=str(self.eyemap_path_xlsx))
         self.assertIsInstance(fig, go.Figure)
 
     def test_hex_heatmap_missing_columns_raises(self):
