@@ -1,6 +1,7 @@
 import io
 import pkgutil
 import os
+import warnings
 from pathlib import Path
 from typing import Optional, Union
 
@@ -69,36 +70,203 @@ def load_dataset(dataset: str) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(data), index_col=0)
 
 
-def _load_local_eyemap(eyemap_path: str, required_cols: tuple) -> pd.DataFrame:
+# The per-eye hex ids every eyemap carries, and the binocular re-encoding that
+# the eyemap archive's `download_eyemaps.py` appends alongside them. Both optic
+# lobes are numbered in the same hex1/hex2 frame, so a left and a right column
+# can share an id pair -- hex1b/hex2b move the eyes into disjoint blocks, which
+# is the only way to draw them together.
+_HEX_COLS = ("hex1", "hex2")
+_HEX_COLS_BINOCULAR = ("hex1b", "hex2b")
+
+# The archive stores one hemisphere per file, named after the hemisphere.
+_EYE_CHOICES = ("right", "left", "both")
+_EYEMAP_SUFFIXES = (".xlsx", ".xls", ".csv")
+
+
+def _hex_columns(which_eye: str) -> tuple:
     """
-    Load a user-supplied local eyemap CSV or Excel file, in place of a bundled
-    ``dataset``.
+    The pair of hex id columns to read for a given ``which_eye``.
+
+    One eye is drawn in its own per-eye numbering, ``hex1``/``hex2``. Both eyes
+    at once needs ``hex1b``/``hex2b``, because the per-eye ids collide between
+    the hemispheres. So the frame follows from ``which_eye`` — and the plotted
+    data's index has to be in the matching frame.
 
     Args:
-        eyemap_path: Path to a local eyemap CSV or Excel (``.xlsx``) file. Files
-            downloaded via https://artxz.github.io/eyemap-archive/ already conform
-            to the expected schema (columns ``p,q,x,y,z[,theta,phi,rootid]``).
-        required_cols: Column names that must be present in the file.
+        which_eye: One of ``'right'``, ``'left'``, ``'both'``.
 
     Returns:
-        pd.DataFrame: The loaded eyemap table.
-    """
-    path = Path(eyemap_path)
-    if not path.exists():
-        raise FileNotFoundError(f"eyemap_path {path} does not exist.")
+        tuple: ``(hex1_col, hex2_col)``.
 
-    if path.suffix.lower() in (".xlsx", ".xls"):
-        df = pd.read_excel(path)
-    else:
-        df = pd.read_csv(path)
-    missing = set(required_cols) - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"eyemap file {path} is missing required column(s): {sorted(missing)}. "
-            f"Expected columns: {required_cols}. Files downloaded from "
-            "https://artxz.github.io/eyemap-archive/ already conform to this schema."
+    Raises:
+        ValueError: If ``which_eye`` is not one of the three choices.
+    """
+    if which_eye not in _EYE_CHOICES:
+        raise ValueError(f"which_eye must be one of {_EYE_CHOICES}, got {which_eye!r}.")
+    return _HEX_COLS_BINOCULAR if which_eye == "both" else _HEX_COLS
+
+
+def _eyemap_files(eyemap_dir, which_eye: str) -> list:
+    """
+    The eyemap file(s) inside ``eyemap_dir`` that ``which_eye`` asks for.
+
+    The archive writes one file per hemisphere, named after it, so selecting an
+    eye is selecting a file: ``'right'`` reads ``right.xlsx``, ``'both'`` reads
+    both and concatenates them.
+
+    Args:
+        eyemap_dir: Dataset directory holding ``right.xlsx``/``left.xlsx``, as
+            written by the archive's ``download_eyemaps.py``. ``.xls`` and
+            ``.csv`` are accepted too, in that order of preference.
+        which_eye: One of ``'right'``, ``'left'``, ``'both'``.
+
+    Returns:
+        list: ``pathlib.Path`` objects, right eye first.
+
+    Raises:
+        NotADirectoryError: If ``eyemap_dir`` is not a directory.
+        FileNotFoundError: If a hemisphere ``which_eye`` needs has no file.
+    """
+    directory = Path(eyemap_dir)
+    if not directory.is_dir():
+        raise NotADirectoryError(
+            f"eyemap_dir {directory} is not a directory. Pass the dataset folder "
+            "holding one eyemap file per hemisphere (e.g. "
+            "params/eyemaps/eyemap_mcns_f20240701/, holding right.xlsx and "
+            "left.xlsx), as written by the eyemap archive's download_eyemaps.py."
         )
-    return df
+
+    wanted = ("right", "left") if which_eye == "both" else (which_eye,)
+    files = []
+    for stem in wanted:
+        for suffix in _EYEMAP_SUFFIXES:
+            candidate = directory / f"{stem}{suffix}"
+            if candidate.exists():
+                files.append(candidate)
+                break
+        else:
+            raise FileNotFoundError(
+                f"eyemap_dir {directory} holds no {stem} eyemap (looked for "
+                f"{stem} with any of {_EYEMAP_SUFFIXES}), which "
+                f"which_eye={which_eye!r} needs. Download it from "
+                "https://artxz.github.io/eyemap-archive/."
+            )
+    return files
+
+
+def _load_local_eyemap(
+    eyemap_dir, which_eye: str, extra_cols: tuple = ()
+) -> pd.DataFrame:
+    """
+    Load a local eyemap directory, in place of a bundled ``dataset``.
+
+    The hex id columns are the authoritative lattice columns: the hexagon
+    positions are always derived from them, as ``x = hex2 - hex1``,
+    ``y = hex2 + hex1`` — or the ``hex1b``/``hex2b`` equivalents when
+    ``which_eye='both'``; see ``_hex_columns()``. Files downloaded from the
+    eyemap archive also carry a ``p,q`` numbering (related by ``hex1 = q + 18``,
+    ``hex2 = p + 19``), but it is **ignored** here.
+
+    Args:
+        eyemap_dir: Dataset directory holding one eyemap file per hemisphere;
+            see ``_eyemap_files()``. Files downloaded via
+            https://artxz.github.io/eyemap-archive/ already conform to the
+            expected schema (columns
+            ``hex1,hex2,hex1b,hex2b,x,y,z[,p,q,theta,phi,rootid]``).
+        which_eye: One of ``'right'``, ``'left'``, ``'both'``.
+        extra_cols: Column names required on top of the hex id pair.
+
+    Returns:
+        pd.DataFrame: The loaded eyemap table, hemispheres concatenated for
+        ``which_eye='both'``.
+    """
+    required_cols = _hex_columns(which_eye) + tuple(extra_cols)
+    frames = []
+    for path in _eyemap_files(eyemap_dir, which_eye):
+        if path.suffix.lower() in (".xlsx", ".xls"):
+            df = pd.read_excel(path)
+        else:
+            df = pd.read_csv(path)
+
+        missing = set(required_cols) - set(df.columns)
+        if missing:
+            hint = ""
+            if missing & set(_HEX_COLS_BINOCULAR):
+                hint = (
+                    f" The two-eye columns {'/'.join(_HEX_COLS_BINOCULAR)} are "
+                    "added by the eyemap archive's download_eyemaps.py — re-run "
+                    "it, or ask for a single eye, which is drawn from "
+                    f"{'/'.join(_HEX_COLS)}."
+                )
+            raise ValueError(
+                f"eyemap file {path} is missing required column(s): "
+                f"{sorted(missing)}. Expected columns: {required_cols}. Files "
+                "downloaded from https://artxz.github.io/eyemap-archive/ already "
+                f"conform to this schema.{hint}"
+            )
+        frames.append(df)
+
+    if len(frames) == 1:
+        return frames[0]
+    return pd.concat(frames, ignore_index=True)
+
+
+# Pixels per x-unit divided by pixels per y-unit for a regular hex lattice in
+# these doubled coordinates. Neighbours sit at (dx, dy) = (+-1, +-1) and
+# (0, +-2), so equal nearest-neighbour distance needs a^2 + b^2 = (2b)^2.
+_HEX_ASPECT = np.sqrt(3)
+
+
+def _warn_unplaced(
+    x_vals, y_vals, background_hex: pd.DataFrame, which_eye: str
+) -> None:
+    """
+    Warn about plotted columns that are not on the eyemap's lattice.
+
+    They are still drawn, just with no background hexagon behind them, so
+    without this they pass unremarked. The proportion says which of two causes
+    it is: a few percent means columns present in the connectome but absent from
+    the eyemap — rim columns with no fitted viewing direction — while most of
+    them means the data's index is in the *other* hex frame, since ``which_eye``
+    selects the hex id columns as well as the lattice.
+
+    Matching is on the exact ``(x, y)`` site, which is what
+    ``plot_mollweide_projection()``'s merge effectively does, so the two
+    functions report the same columns as unplaced.
+
+    Args:
+        x_vals: Data x coordinates.
+        y_vals: Data y coordinates.
+        background_hex: The background lattice being drawn.
+        which_eye: One of ``'right'``, ``'left'``, ``'both'``.
+    """
+    sites = set(
+        zip(
+            np.asarray(background_hex["x"], dtype=float).tolist(),
+            np.asarray(background_hex["y"], dtype=float).tolist(),
+        )
+    )
+    points = list(
+        zip(
+            np.asarray(x_vals, dtype=float).tolist(),
+            np.asarray(y_vals, dtype=float).tolist(),
+        )
+    )
+    n_unplaced = sum(1 for point in points if point not in sites)
+    if not n_unplaced:
+        return
+    warnings.warn(
+        f"{n_unplaced} of {len(points)} plotted columns are not on the "
+        f"which_eye={which_eye!r} eyemap lattice, so they are drawn with no "
+        "background hexagon. A few percent is expected: columns present in the "
+        "connectome but absent from the eyemap, typically rim columns with no "
+        "fitted viewing direction. Most of them instead means the index is in "
+        f"the other hex frame -- which_eye='both' expects "
+        f"{'/'.join(_HEX_COLS_BINOCULAR)} coordinates, one eye expects "
+        f"{'/'.join(_HEX_COLS)}.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def map_to_experiment(df, dataset=None, custom_experiment=None):
@@ -176,7 +344,9 @@ def hex_heatmap(
     global_min: Optional[float] = None,
     global_max: Optional[float] = None,
     dataset: Optional[str] = "mcns_right",
-    eyemap_path: Optional[str] = None,
+    eyemap_dir: Optional[str] = None,
+    which_eye: str = "right",
+    equal_aspect: bool = True,
     value_name: str = "weight",
     colorbar: bool = True,
     title: Optional[str] = None,
@@ -200,7 +370,7 @@ def hex_heatmap(
         sizing (Optional[dict]): Dict containing size formatting variables. Possible
             keys are:
 
-                - 'fig_width': int, default=260 (mm)
+                - 'fig_width': int, default=260 (mm). With ``eyemap_dir``, defaults instead to the width that makes the lattice's own extent fill the figure, so markers tile without gaps whatever the lattice covers (~260 mm for one medulla, ~504 mm for two eyes side by side).
                 - 'fig_height': int, default=220 (mm)
                 - 'fig_margin': int, default=0 (mm)
                 - 'fsize_ticks_pt': int, default=20 (points)
@@ -230,10 +400,31 @@ def hex_heatmap(
                 - 'mcns_right': columnar coordinates of individual cells from columnar cell types: L1, L2, L3, L5, Mi1, Mi4, Mi9, C2, C3, Tm1, Tm2, Tm4, Tm9, Tm20, T1, within the medulla of the right optic lobe, from Nern et al. 2024.
                 - 'fafb_right': columnar coordinates of individual cells from columnar cell types, in the right optic lobe of FAFB, from Matsliah et al. 2024.
 
-        eyemap_path (Optional[str]): Path to a local eyemap CSV or Excel (``.xlsx``)
-            file with at least ``p`` and ``q`` columns (e.g. as downloaded from
-            https://artxz.github.io/eyemap-archive/). When given, this takes
-            precedence over ``dataset`` for the background hexagon lattice.
+        eyemap_dir (Optional[str]): Path to a **directory** holding one eyemap
+            file per hemisphere — ``right.xlsx`` and ``left.xlsx``, as written by
+            the eyemap archive's ``download_eyemaps.py`` (``.xls``/``.csv`` also
+            accepted). ``which_eye`` picks which of them to read. When given,
+            this takes precedence over ``dataset`` for the background hexagon
+            lattice. Any ``p``/``q`` columns are ignored; see
+            ``_load_local_eyemap()``.
+        which_eye (str): Default='right'. Which eye to draw, one of 'right',
+            'left', 'both'. This chooses both the file(s) read and the hex id
+            columns they are read from, so ``df``'s index must be in the matching
+            frame: one eye is drawn from that hemisphere's own ``hex1``/``hex2``,
+            while 'both' is drawn from ``hex1b``/``hex2b`` — the same lattice
+            sites re-encoded into disjoint per-eye blocks, since the two optic
+            lobes share one ``hex1``/``hex2`` numbering and would otherwise
+            collapse onto each other. Points landing off the resulting lattice
+            are drawn but warned about, which is what catches a frame mismatch.
+            Only 'right' is valid without ``eyemap_dir``: the bundled datasets
+            cover the right optic lobe only.
+        equal_aspect (bool): Default=True. Lock the x axis to sqrt(3) times the
+            y axis scale via plotly's ``scaleanchor``/``scaleratio``, which is
+            what makes the hexagons regular in these doubled coordinates
+            (neighbours at (dx, dy) = (+-1, +-1) and (0, +-2)). With this on,
+            hexagon shape no longer depends on the figure's aspect ratio - a
+            mismatched ``fig_width``/``fig_height`` letterboxes instead of
+            shearing. Set False to reproduce figures made before this option.
         title (Optional[str]): Title for the plot. If None, no title is displayed.
 
     Returns:
@@ -327,11 +518,28 @@ def hex_heatmap(
         "papercolor": "rgba(255,255,255,255)",
     }
 
-    if eyemap_path is not None:
+    # load all hex coordinates. Done before the sizing defaults, which need the
+    # lattice's extent.
+    hex1_col, hex2_col = _hex_columns(which_eye)
+    if eyemap_dir is not None:
+        eyemap = _load_local_eyemap(eyemap_dir, which_eye)
+        background_hex = pd.DataFrame(
+            {
+                "x": eyemap[hex2_col] - eyemap[hex1_col],
+                "y": eyemap[hex2_col] + eyemap[hex1_col],
+            }
+        )
         markersize = 18
+    elif which_eye != "right":
+        raise ValueError(
+            f"which_eye={which_eye!r} needs eyemap_dir: the bundled datasets "
+            "('mcns_right', 'fafb_right') cover the right optic lobe only."
+        )
     elif dataset == "mcns_right":
+        background_hex = load_dataset("Nern2024")
         markersize = 18
     elif dataset == "fafb_right":
+        background_hex = load_dataset("Matsliah2024")
         markersize = 20
     else:
         # raise error
@@ -339,9 +547,13 @@ def hex_heatmap(
             "Dataset not recognized. Currently available datasets are 'mcns_right', "
             "'fafb_right'."
         )
+    # only get the unique combination of 'x' and 'y' columns
+    background_hex = background_hex.drop_duplicates(subset=["x", "y"])
 
     default_sizing = {
-        "fig_width": 260 if colorbar else 206,  # units = mm
+        # None with `eyemap_dir`: derived from the lattice extent below, once
+        # any caller-supplied `fig_height` is known.
+        "fig_width": None if eyemap_dir is not None else (260 if colorbar else 206),
         "fig_height": 220,  # units = mm
         "fig_margin": 0,
         "fsize_ticks_pt": 20,
@@ -365,6 +577,19 @@ def hex_heatmap(
     if sizing is not None:
         default_sizing.update(sizing)
     sizing = default_sizing
+
+    if sizing["fig_width"] is None:
+        # Size the figure to the lattice, so a marker of `markersize` px tiles
+        # the grid whatever the lattice covers. The +2 is one marker of padding
+        # at each end; the +54 mm is the room plotly's colorbar takes. This
+        # reproduces the 206/260 mm defaults for a single medulla lattice.
+        x_span = (background_hex["x"].max() - background_hex["x"].min()) + 2
+        y_span = (
+            (background_hex["y"].max() - background_hex["y"].min()) + 2
+        ) / _HEX_ASPECT
+        sizing["fig_width"] = round(
+            sizing["fig_height"] * x_span / y_span + (54 if colorbar else 0)
+        )
 
     # Constants for unit conversion
     POINTS_PER_INCH = 72  # Typography standard: 1 point = 1/72 inch
@@ -398,26 +623,6 @@ def hex_heatmap(
     # Symbol number to choose to plot hexagons
     symbol_number = 15
 
-    # load all hex coordinates
-    if eyemap_path is not None:
-        eyemap = _load_local_eyemap(eyemap_path, required_cols=("hex1", "hex2"))
-        background_hex = pd.DataFrame(
-            {"x": eyemap["hex2"] - eyemap["hex1"], 
-             "y": eyemap["hex2"] + eyemap["hex1"]}
-            )
-    elif dataset == "mcns_right":
-        background_hex = load_dataset("Nern2024")
-    elif dataset == "fafb_right":
-        background_hex = load_dataset("Matsliah2024")
-    else:
-        # raise error
-        raise ValueError(
-            "Dataset not recognized. Currently available datasets are 'mcns_right', "
-            "'fafb_right'."
-        )
-    # only get the unique combination of 'x' and 'y' columns
-    background_hex = background_hex.drop_duplicates(subset=["x", "y"])
-
     # initiate plot
     fig = go.Figure()
     top_margin = sizing["title_margin"] if title else 0
@@ -439,8 +644,17 @@ def hex_heatmap(
             else None
         ),
     )
+    # scaleanchor/scaleratio is what keeps the hexagons regular; see
+    # `equal_aspect` in the docstring.
+    hex_aspect = (
+        {"scaleanchor": "y", "scaleratio": _HEX_ASPECT} if equal_aspect else {}
+    )
     fig.update_xaxes(
-        showgrid=False, showticklabels=False, showline=False, visible=False
+        showgrid=False,
+        showticklabels=False,
+        showline=False,
+        visible=False,
+        **hex_aspect,
     )
     fig.update_yaxes(
         showgrid=False, showticklabels=False, showline=False, visible=False
@@ -450,6 +664,10 @@ def hex_heatmap(
     df = df[(df.index != "nan") & (~df.index.isnull())]
     coords = [tuple(map(float, idx.split(","))) for idx in df.index]
     x_vals, y_vals = zip(*coords)  # Separate into x and y lists
+
+    # Everything is drawn; columns off the lattice just get no background
+    # hexagon, so flag them rather than silently accepting a frame mismatch.
+    _warn_unplaced(x_vals, y_vals, background_hex, which_eye)
 
     if isinstance(df, pd.Series) or len(df.columns) == 1:
         if isinstance(df, pd.DataFrame):
@@ -657,7 +875,8 @@ def plot_mollweide_projection(
     global_min: Optional[float] = None,
     global_max: Optional[float] = None,
     dataset: str = "Zhao2024",
-    eyemap_path: Optional[str] = None,
+    eyemap_dir: Optional[str] = None,
+    which_eye: str = "right",
     marker_size: int = 8,
     value_name: str = "weight",
     colorbar: bool = True,
@@ -683,15 +902,31 @@ def plot_mollweide_projection(
 
             - 'Zhao2024': mapping from hexagonal coordinates to 3D coordinates, update from Zhao et al. 2022 (https://www.biorxiv.org/content/10.1101/2022.12.14.520178v1).
 
-        eyemap_path (Optional[str]): Path to a local eyemap CSV or Excel (``.xlsx``)
-            file with ``p,q,x,y,z`` columns (e.g. as downloaded from
-            https://artxz.github.io/eyemap-archive/). When given, this takes
-            precedence over ``dataset``.
+        eyemap_dir (Optional[str]): Path to a **directory** holding one eyemap
+            file per hemisphere — ``right.xlsx`` and ``left.xlsx``, each with
+            ``hex1,hex2,x,y,z`` columns, as written by the eyemap archive's
+            ``download_eyemaps.py`` (``.xls``/``.csv`` also accepted).
+            ``which_eye`` picks which of them to read. When given, this takes
+            precedence over ``dataset``. Any ``p``/``q`` columns are ignored;
+            see ``_load_local_eyemap()``.
+        which_eye (str): Default='right'. Which eye to project, one of 'right',
+            'left', 'both'; see ``hex_heatmap()`` for how this chooses both the
+            file(s) and the hex id columns, and hence which frame ``data``'s
+            index must be in. Each row keeps its own eye's viewing direction, so
+            'both' projects the two hemifields correctly; a single eye simply
+            leaves the other hemifield blank. Only 'right' is valid without
+            ``eyemap_dir``: the bundled dataset covers the right optic lobe only.
         marker_size (int): Size of markers in the plot.
 
     Returns:
         go.Figure:
             A Plotly figure object containing the mollweide projection heatmap.
+
+    Warns:
+        UserWarning: When some rows of ``data`` have no matching ``hex1``/
+            ``hex2`` in the eyemap and so cannot be placed on the sphere. Those
+            rows are dropped from the figure. Rim columns present in the
+            connectome but absent from the eyemap are the usual cause.
     """
 
     def cart2sph(xyz: np.array) -> np.array:
@@ -817,6 +1052,18 @@ def plot_mollweide_projection(
     # Clean data - remove NaN indices
     data = data[(data.index != "nan") & (~data.index.isnull())]
 
+    # Load eyemap data and convert coordinates
+    hex1_col, hex2_col = _hex_columns(which_eye)
+    if eyemap_dir is not None:
+        ucl_hex = _load_local_eyemap(eyemap_dir, which_eye, extra_cols=("x", "y", "z"))
+    elif which_eye != "right":
+        raise ValueError(
+            f"which_eye={which_eye!r} needs eyemap_dir: the bundled dataset "
+            f"({dataset!r}) covers the right optic lobe only."
+        )
+    else:
+        ucl_hex = load_dataset(dataset)
+
     # Convert string indices to coordinate arrays
     coords = [tuple(map(float, idx.split(","))) for idx in data.index]
     coord_array = np.array(coords)
@@ -828,17 +1075,13 @@ def plot_mollweide_projection(
     if global_max is None:
         global_max = vals.max()
 
-    # Load eyemap data and convert coordinates
-    if eyemap_path is not None:
-        ucl_hex = _load_local_eyemap(eyemap_path, required_cols=("hex1", "hex2", "x", "y", "z"))
-    else:
-        ucl_hex = load_dataset(dataset)
     rtp2 = cart2sph(ucl_hex[["x", "y", "z"]].values)
     xy = sph2Mollweide(rtp2[:, 1:3])
     xy[:, 0] = -xy[:, 0]  # flip x axis
-    xypq_moll = np.concatenate((xy, ucl_hex[["hex2", "hex1"]].values), axis=1)
-    xypq_moll = pd.DataFrame(xypq_moll, columns=["x", "y", "hex2", "hex1"])
-    xypq_moll[["hex2", "hex1"]] = xypq_moll[["hex2", "hex1"]].astype(int)
+    # Internal names stay hex2/hex1 whichever frame the eyemap columns are in.
+    hex_moll = np.concatenate((xy, ucl_hex[[hex2_col, hex1_col]].values), axis=1)
+    hex_moll = pd.DataFrame(hex_moll, columns=["x", "y", "hex2", "hex1"])
+    hex_moll[["hex2", "hex1"]] = hex_moll[["hex2", "hex1"]].astype(int)
 
     # Convert data coordinates to Mollweide
     hex1_id = (coord_array[:, 1] - coord_array[:, 0]) / 2
@@ -847,11 +1090,26 @@ def plot_mollweide_projection(
     coord_df = pd.DataFrame({"hex1_id": hex1_id, "hex2_id": hex2_id}, index=data.index)
 
     merged_coords = coord_df.merge(
-        xypq_moll, left_on=["hex1_id", "hex2_id"], right_on=["hex1", "hex2"], how="left"
+        hex_moll, left_on=["hex1_id", "hex2_id"], right_on=["hex1", "hex2"], how="left"
     )
 
     x_mollweide = merged_coords["x"].values
     y_mollweide = merged_coords["y"].values
+
+    # Rows with no matching lattice hex have no direction on the sphere, so they
+    # drop out of the figure. Say so rather than losing them silently.
+    n_unplaced = int(np.isnan(x_mollweide).sum())
+    if n_unplaced:
+        warnings.warn(
+            f"{n_unplaced} of {len(x_mollweide)} rows have no matching "
+            f"{hex1_col}/{hex2_col} in the eyemap (which_eye={which_eye!r}) and "
+            "are left out of the projection. Columns present in the connectome "
+            "but absent from the eyemap -- typically rim columns with no fitted "
+            "viewing direction -- are the usual cause; if nearly every row is "
+            "unplaced, the data's index is probably in the other hex frame.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # Create figure
     fig = go.Figure()
