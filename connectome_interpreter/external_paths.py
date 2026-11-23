@@ -24,6 +24,7 @@ def compute_flow_hitting_time(
     flow_seed_idx: np.ndarray[int],
     flow_steps: int,
     flow_thre: float,
+    method: Optional[str] = None,
 ):
     """
     Compute hitting time for all cells in conn_df.
@@ -35,6 +36,12 @@ def compute_flow_hitting_time(
         flow_seed_idx (np.ndarray): Array of seed cell indices.
         flow_steps (int): Number of steps for flow calculation.
         flow_thre (float): Threshold for activation in flow calculation.
+        method (str, optional): Passed to navis' `BayesianTraversalModel`:
+            'conditioned' (the corrected model of navis >= 1.12) or 'legacy' (the
+            model of navis < 1.12, to reproduce older results). Needs a navis
+            version whose `BayesianTraversalModel` takes `method`
+            (navis-org/navis#202). Defaults to None, which uses navis' own default
+            and works with any navis version.
 
     Returns:
         pd.DataFrame:
@@ -48,6 +55,19 @@ def compute_flow_hitting_time(
         raise ImportError(
             "The 'navis' library is required for computing information flow."
         ) from e
+
+    model_kwargs = {}
+    if method is not None:
+        import inspect
+
+        if "method" not in inspect.signature(BayesianTraversalModel.__init__).parameters:
+            import navis
+
+            raise ValueError(
+                f"method={method!r} needs a navis whose BayesianTraversalModel takes "
+                f"`method` (navis-org/navis#202); navis {navis.__version__} does not."
+            )
+        model_kwargs["method"] = method
 
     # choose threshold for flow activation and define model
     def my_act(x):
@@ -74,7 +94,11 @@ def compute_flow_hitting_time(
     edges = conn_df[["pre", "post", "weight"]]
     edges.columns = ["source", "target", "weight"]
     model = BayesianTraversalModel(
-        edges, flow_seed_idx, max_steps=flow_steps + 1, traversal_func=my_act
+        edges,
+        flow_seed_idx,
+        max_steps=flow_steps + 1,
+        traversal_func=my_act,
+        **model_kwargs,
     )
 
     res = model.run()
@@ -118,6 +142,7 @@ def find_instance_flow(
     save_prefix: Optional[str] = "flow_",
     flow_steps: int = 20,
     flow_thre: float = 0.1,
+    method: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Get the hitting time for all cell groups. The hitting time is computed using the
@@ -140,6 +165,9 @@ def find_instance_flow(
             calculation.
         flow_steps (int): Number of steps for flow calculation.
         flow_thre (float): Threshold for flow calculation.
+        method (str, optional): Traversal model passed to
+            `compute_flow_hitting_time` ('conditioned' or 'legacy'; None uses
+            navis' default). Ignored when the hitting-time file already exists.
 
     Returns:
         pd.DataFrame:
@@ -184,7 +212,7 @@ def find_instance_flow(
                 f"Please check the flow_seed_groups: {flow_seed_groups}."
             )
         flow_df = compute_flow_hitting_time(
-            inprop, flow_seed_idx, flow_steps, flow_thre
+            inprop, flow_seed_idx, flow_steps, flow_thre, method=method
         )
         # add cell group to flow_df
         # note: this only includes indices in flow_seed_idx, which could in theory be a
